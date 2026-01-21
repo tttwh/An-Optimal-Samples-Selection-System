@@ -36,3 +36,14 @@ Alternatively:
 - `results/`: saved `.db` result files
 - `docs/`: documentation
 
+
+## Mobile (Android/iOS)
+
+- Source: `mobile/`
+- Notes: offline exact solving (Branch-and-Bound) can be slow for larger `n`.
+- Build instructions: `mobile/README.md`
+
+## Windows Installer
+
+- Packaging scripts: `packaging/windows/`
+- CI workflow: `.github/workflows/windows-installer.yml` (PyInstaller + Inno Setup)
