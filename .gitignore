@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Virtual env
+.venv/
+venv/
+ENV/
+
+# OS
+.DS_Store
+
+# Results (SQLite)
+results/*.db
+
+# Build artifacts
+build/
+dist/
+
+# Mobile build
+mobile/.buildozer/
+mobile/bin/
+
+# IDE
+.vscode/
+.idea/

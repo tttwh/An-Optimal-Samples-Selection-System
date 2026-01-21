@@ -1,0 +1,179 @@
+<ComputeScreen>:
+    name: "compute"
+    BoxLayout:
+        orientation: "vertical"
+        padding: "12dp"
+        spacing: "10dp"
+
+        Label:
+            text: "Optimal Samples Selection (Mobile)"
+            font_size: "20sp"
+            size_hint_y: None
+            height: self.texture_size[1] + dp(10)
+
+        GridLayout:
+            cols: 2
+            row_default_height: "40dp"
+            row_force_default: True
+            col_default_width: "120dp"
+            col_force_default: False
+            size_hint_y: None
+            height: self.minimum_height
+            spacing: "8dp"
+
+            Label:
+                text: "m"
+            TextInput:
+                id: m_in
+                text: root.m_text
+                input_filter: "int"
+
+            Label:
+                text: "n"
+            TextInput:
+                id: n_in
+                text: root.n_text
+                input_filter: "int"
+
+            Label:
+                text: "k"
+            TextInput:
+                id: k_in
+                text: root.k_text
+                input_filter: "int"
+
+            Label:
+                text: "j"
+            TextInput:
+                id: j_in
+                text: root.j_text
+                input_filter: "int"
+
+            Label:
+                text: "s"
+            TextInput:
+                id: s_in
+                text: root.s_text
+                input_filter: "int"
+
+        BoxLayout:
+            size_hint_y: None
+            height: "40dp"
+            spacing: "8dp"
+
+            Spinner:
+                id: mode_spinner
+                text: root.mode
+                values: ["Random", "Manual"]
+                on_text: root.mode = self.text
+
+            Button:
+                text: "Generate"
+                on_release: root.generate_samples()
+
+        TextInput:
+            id: manual_samples
+            hint_text: "Manual samples (comma-separated), only used in Manual mode"
+            multiline: False
+            size_hint_y: None
+            height: "40dp"
+
+        TextInput:
+            id: samples_out
+            hint_text: "Selected samples"
+            text: root.samples_text
+            readonly: True
+            multiline: False
+            size_hint_y: None
+            height: "40dp"
+
+        BoxLayout:
+            size_hint_y: None
+            height: "44dp"
+            spacing: "8dp"
+
+            Button:
+                text: "SOLVE (Exact)"
+                on_release: root.solve()
+
+            Button:
+                text: "Save"
+                on_release: root.save_to_db()
+
+            Button:
+                text: "Database"
+                on_release:
+                    app.root.current = "db"
+                    app.root.get_screen("db").refresh()
+
+        Label:
+            text: root.status_text
+            size_hint_y: None
+            height: self.texture_size[1] + dp(10)
+
+        ScrollView:
+            do_scroll_x: False
+            Label:
+                id: results_label
+                text: root.results_text
+                text_size: self.width, None
+                size_hint_y: None
+                height: self.texture_size[1]
+
+<DatabaseScreen>:
+    name: "db"
+    BoxLayout:
+        orientation: "vertical"
+        padding: "12dp"
+        spacing: "10dp"
+
+        BoxLayout:
+            size_hint_y: None
+            height: "44dp"
+            spacing: "8dp"
+
+            Button:
+                text: "Back"
+                on_release: app.root.current = "compute"
+
+            Button:
+                text: "Refresh"
+                on_release: root.refresh()
+
+        Spinner:
+            id: file_spinner
+            text: root.selected_filename
+            values: root.filenames
+            on_text: root.selected_filename = self.text
+            size_hint_y: None
+            height: "44dp"
+
+        BoxLayout:
+            size_hint_y: None
+            height: "44dp"
+            spacing: "8dp"
+
+            Button:
+                text: "Preview"
+                on_release: root.preview()
+
+            Button:
+                text: "Load"
+                on_release: root.load_into_compute()
+
+            Button:
+                text: "Delete"
+                on_release: root.delete_selected()
+
+        ScrollView:
+            do_scroll_x: False
+            Label:
+                id: preview_label
+                text: root.preview_text
+                text_size: self.width, None
+                size_hint_y: None
+                height: self.texture_size[1]
+
+ScreenManager:
+    ComputeScreen:
+    DatabaseScreen:
