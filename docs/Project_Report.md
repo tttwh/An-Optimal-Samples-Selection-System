@@ -115,12 +115,21 @@ The method `solve_ilp()` tries solvers in the following order:
 3. A custom **Branch and Bound** fallback.
 
 A 5-minute time limit is set for OR-Tools and PuLP to keep the GUI responsive on larger instances.
+The application records solver status separately: `OPTIMAL` means the result is proven minimum, while `FEASIBLE` means the result satisfies all coverage constraints but may still be improvable.
+OR-Tools CP-SAT is configured to use multiple CPU search workers. GPU acceleration is not used because the branch-and-bound / constraint-propagation workload is irregular and is not a good fit for the dense numeric kernels where GPUs are most effective.
 
-### 5.3 GUI Responsiveness
+### 5.3 Known Cover Cache
+
+The system maintains a reusable SQLite cache at `results/known_covers.sqlite`.
+For the special case `s = j`, the project instance is equivalent to the standard covering design `C(n,k,j)`, so proven optimal results from the La Jolla Covering Repository can be returned directly.
+For non-exact or `s < j` cases, cached covers are used only as feasible upper bounds and OR-Tools hints; the solver is still allowed to search the full candidate space for better solutions.
+Before constructing the solver, the GUI estimates `C(n,j) * C(n,k)`, the number of pairwise coverage checks required by the current implementation. If this estimate is too large, the system avoids building the full model and either returns a cached feasible result or asks the user to choose smaller parameters.
+
+### 5.4 GUI Responsiveness
 
 The GUI uses a background thread (`SolverThread`) to run the solver without blocking the main UI thread. This allows the interface to remain responsive while the optimization runs.
 
-### 5.4 Result Persistence (SQLite)
+### 5.5 Result Persistence (SQLite)
 
 Results are stored as individual SQLite files under `results/` using a naming convention:
 

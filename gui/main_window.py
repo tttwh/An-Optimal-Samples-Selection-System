@@ -10,6 +10,7 @@ Provides a user-friendly GUI for:
 
 import sys
 import random
+from math import comb
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QSpinBox, QPushButton, QTextEdit, QTableWidget, QTableWidgetItem,
@@ -28,22 +29,30 @@ from core.solver import OptimalSamplesSolver
 from database.db_manager import DatabaseManager
 
 
+MAX_GUI_COVER_RELATION_CHECKS = 20_000_000
+MAX_DISPLAYED_GROUPS = 5000
+
+
 class SolverThread(QThread):
     """Background thread for running the solver."""
-    finished = pyqtSignal(list, float, str)
+    finished = pyqtSignal(list, float, str, str)
     error = pyqtSignal(str)
     progress = pyqtSignal(int, int, int)
 
-    def __init__(self, solver):
+    def __init__(self, solver, initial_solution=None, initial_solution_status="FEASIBLE"):
         super().__init__()
         self.solver = solver
+        self.initial_solution = initial_solution
+        self.initial_solution_status = initial_solution_status
 
     def run(self):
         try:
             result, solve_time, method = self.solver.solve_ilp(
-                progress_callback=lambda d, c, b: self.progress.emit(d, c, b)
+                progress_callback=lambda d, c, b: self.progress.emit(d, c, b),
+                initial_solution=self.initial_solution,
+                initial_solution_status=self.initial_solution_status,
             )
-            self.finished.emit(result, solve_time, method)
+            self.finished.emit(result, solve_time, method, self.solver.last_status)
         except Exception as e:
             self.error.emit(str(e))
 
@@ -54,12 +63,14 @@ class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.db_manager = DatabaseManager()
+        self.db_manager.seed_builtin_known_covers()
         self.current_samples = []
         self.current_results = []
         self.solver_thread = None
 
         self.last_solve_time = 0.0
         self.last_method = ""
+        self.last_status = "NOT_SOLVED"
 
         self.init_ui()
 
@@ -359,8 +370,41 @@ class MainWindow(QMainWindow):
             return
 
         try:
+            cached_solution, cached_status, cached_message = self.get_precomputed_solution()
+            if cached_solution and cached_status == "OPTIMAL":
+                self.on_solve_finished(cached_solution, 0.0, cached_message, cached_status)
+                self.status_bar.showMessage(f"Loaded {len(cached_solution)} proven optimal groups from cache")
+                return
+
+            estimate = self.estimate_problem_size(n, k, j)
+            if estimate['relation_checks'] > MAX_GUI_COVER_RELATION_CHECKS:
+                if cached_solution:
+                    self.on_solve_finished(cached_solution, 0.0, cached_message, cached_status)
+                    self.status_bar.showMessage(
+                        f"Problem is too large for exact solving; loaded {len(cached_solution)} cached feasible groups"
+                    )
+                    return
+
+                QMessageBox.warning(
+                    self,
+                    "Problem Too Large",
+                    "This parameter set is too large for the current exact local solver.\n\n"
+                    f"j-subsets: {estimate['num_j_subsets']:,}\n"
+                    f"k-groups: {estimate['num_k_groups']:,}\n"
+                    f"Coverage checks: {estimate['relation_checks']:,}\n\n"
+                    "Import a known cover, reduce n/k/j, or use a smaller instance for demonstration."
+                )
+                self.status_bar.showMessage("Problem too large; solving was not started")
+                return
+
             solver = OptimalSamplesSolver(n, k, j, s, self.current_samples)
             stats = solver.get_statistics()
+            initial_solution, initial_status, cache_message = self.get_cached_solution_hint(solver)
+
+            if initial_solution and initial_status == "OPTIMAL":
+                self.on_solve_finished(initial_solution, 0.0, cache_message, "OPTIMAL")
+                self.status_bar.showMessage(f"Loaded {len(initial_solution)} optimal groups from cache")
+                return
 
             self.status_bar.showMessage(f"Solving... (j-subsets: {stats['num_j_subsets']}, k-groups: {stats['num_k_groups']})")
             self.progress_bar.setVisible(True)
@@ -368,7 +412,7 @@ class MainWindow(QMainWindow):
             self.solve_btn.setEnabled(False)
 
             # Run solver in background thread
-            self.solver_thread = SolverThread(solver)
+            self.solver_thread = SolverThread(solver, initial_solution, initial_status)
             self.solver_thread.finished.connect(self.on_solve_finished)
             self.solver_thread.error.connect(self.on_solve_error)
             self.solver_thread.start()
@@ -376,7 +420,104 @@ class MainWindow(QMainWindow):
         except ValueError as e:
             QMessageBox.critical(self, "Error", str(e))
 
-    def on_solve_finished(self, result, solve_time, method):
+    def estimate_problem_size(self, n, k, j):
+        num_j_subsets = comb(n, j)
+        num_k_groups = comb(n, k)
+        return {
+            'num_j_subsets': num_j_subsets,
+            'num_k_groups': num_k_groups,
+            'relation_checks': num_j_subsets * num_k_groups,
+        }
+
+    def get_precomputed_solution(self):
+        """Return a trusted cached result before building the expensive solver object."""
+        n = self.n_spin.value()
+        k = self.k_spin.value()
+        j = self.j_spin.value()
+        s = self.s_spin.value()
+
+        cached = self.db_manager.get_project_result(n, k, j, s)
+        if cached:
+            groups = self.map_canonical_groups_to_samples(cached['groups'])
+            if cached['status'] == "OPTIMAL":
+                return groups, "OPTIMAL", "Project result cache"
+            best_groups = groups
+            best_status = cached['status']
+            best_message = "Project result cache"
+        else:
+            best_groups = None
+            best_status = "FEASIBLE"
+            best_message = "Cached upper bound"
+
+        standard_t = j if s == j else s
+        standard = self.db_manager.get_standard_cover(n, k, standard_t)
+        if standard:
+            groups = self.map_canonical_groups_to_samples(standard['blocks'])
+            if s == j and standard['is_proven_optimal']:
+                self.db_manager.save_project_result(
+                    n, k, j, s, standard['blocks'], "OPTIMAL",
+                    method="La Jolla Covering Repository",
+                    source=standard['source_url'],
+                )
+                return groups, "OPTIMAL", "La Jolla exact cover cache"
+
+            if best_groups is None or len(groups) < len(best_groups):
+                best_groups = groups
+                best_status = "FEASIBLE_CACHED"
+                best_message = "La Jolla upper-bound cache"
+
+        return best_groups, best_status, best_message
+
+    def get_cached_solution_hint(self, solver):
+        """Return a cached exact result or a feasible hint for OR-Tools."""
+        n = self.n_spin.value()
+        k = self.k_spin.value()
+        j = self.j_spin.value()
+        s = self.s_spin.value()
+
+        cached = self.db_manager.get_project_result(n, k, j, s)
+        if cached:
+            groups = self.map_canonical_groups_to_samples(cached['groups'])
+            if solver.verify_solution(groups):
+                if cached['status'] == "OPTIMAL":
+                    return groups, "OPTIMAL", "Project result cache"
+                best_groups = groups
+                best_status = cached['status']
+            else:
+                best_groups = None
+                best_status = "FEASIBLE"
+        else:
+            best_groups = None
+            best_status = "FEASIBLE"
+
+        standard_t = j if s == j else s
+        standard = self.db_manager.get_standard_cover(n, k, standard_t)
+        if standard:
+            groups = self.map_canonical_groups_to_samples(standard['blocks'])
+            if solver.verify_solution(groups):
+                if s == j and standard['is_proven_optimal']:
+                    self.db_manager.save_project_result(
+                        n, k, j, s, standard['blocks'], "OPTIMAL",
+                        method="La Jolla Covering Repository",
+                        source=standard['source_url'],
+                    )
+                    return groups, "OPTIMAL", "La Jolla exact cover cache"
+
+                if best_groups is None or len(groups) < len(best_groups):
+                    best_groups = groups
+                    best_status = "FEASIBLE_CACHED"
+
+        return best_groups, best_status, "Cached upper bound"
+
+    def map_canonical_groups_to_samples(self, groups):
+        samples = sorted(self.current_samples)
+        return [tuple(samples[index - 1] for index in group) for group in groups]
+
+    def map_sample_groups_to_canonical(self, groups):
+        index_by_sample = {sample: i + 1 for i, sample in enumerate(sorted(self.current_samples))}
+        return [tuple(sorted(index_by_sample[value] for value in group)) for group in groups]
+
+    def on_solve_finished(self, result, solve_time, method, status):
         """Handle solver completion."""
         self.progress_bar.setVisible(False)
         self.solve_btn.setEnabled(True)
@@ -384,20 +525,38 @@ class MainWindow(QMainWindow):
 
         self.last_solve_time = solve_time
         self.last_method = method
+        self.last_status = status
+
+        canonical_groups = self.map_sample_groups_to_canonical(result)
+        self.db_manager.save_project_result(
+            self.n_spin.value(), self.k_spin.value(), self.j_spin.value(), self.s_spin.value(),
+            canonical_groups, status, method=method, source="local solve/cache",
+        )
 
         # Update stats
         self.stats_label.setText(
-            f"Method: {method} | Time: {solve_time:.3f}s | Groups found: {len(result)}"
+            f"Method: {method} | Status: {status} | Time: {solve_time:.3f}s | "
+            f"Groups found: {len(result)}"
         )
 
         # Update table
-        self.results_table.setRowCount(len(result))
-        for i, group in enumerate(result):
+        display_rows = min(len(result), MAX_DISPLAYED_GROUPS)
+        self.results_table.setRowCount(display_rows)
+        for i, group in enumerate(result[:display_rows]):
             self.results_table.setItem(i, 0, QTableWidgetItem(str(i + 1)))
             self.results_table.setItem(i, 1, QTableWidgetItem(", ".join(map(str, group))))
 
+        if len(result) > MAX_DISPLAYED_GROUPS:
+            self.stats_label.setText(
+                self.stats_label.text() +
+                f" | Showing first {MAX_DISPLAYED_GROUPS} rows"
+            )
+
         self.save_btn.setEnabled(True)
-        self.status_bar.showMessage(f"Found {len(result)} optimal groups in {solve_time:.3f}s using {method}")
+        if status == "OPTIMAL":
+            self.status_bar.showMessage(f"Found {len(result)} proven optimal groups in {solve_time:.3f}s using {method}")
+        else:
+            self.status_bar.showMessage(f"Found {len(result)} feasible groups in {solve_time:.3f}s using {method}; optimality not proven")
 
     def on_solve_error(self, error_msg):
         """Handle solver error."""
@@ -424,7 +583,8 @@ class MainWindow(QMainWindow):
                 self.current_samples,
                 self.current_results,
                 self.last_solve_time,  # solve_time
-                self.last_method or "ILP"  # method
+                self.last_method or "ILP",  # method
+                self.last_status or "UNKNOWN",
             )
             QMessageBox.information(self, "Success", f"Results saved to: {filename}")
             self.refresh_db_list()
@@ -475,11 +635,14 @@ class MainWindow(QMainWindow):
             preview_text = f"File: {filename}\n"
             preview_text += f"Parameters: m={result['m']}, n={result['n']}, k={result['k']}, j={result['j']}, s={result['s']}\n"
             preview_text += f"Samples: {result['samples']}\n"
-            preview_text += f"Method: {result['method']} | Time: {result['solve_time']:.3f}s\n"
+            preview_text += f"Method: {result['method']} | Status: {result.get('status', 'UNKNOWN')} | Time: {result['solve_time']:.3f}s\n"
             preview_text += f"Created: {result['created_at']}\n\n"
             preview_text += f"Groups ({result['num_groups']} total):\n"
-            for i, group in enumerate(result['groups']):
+            preview_groups = result['groups'][:MAX_DISPLAYED_GROUPS]
+            for i, group in enumerate(preview_groups):
                 preview_text += f"  {i+1}. {', '.join(map(str, group))}\n"
+            if len(result['groups']) > MAX_DISPLAYED_GROUPS:
+                preview_text += f"\nShowing first {MAX_DISPLAYED_GROUPS} groups only.\n"
 
             self.preview_text.setText(preview_text)
 
@@ -495,13 +658,21 @@ class MainWindow(QMainWindow):
 
             self.last_solve_time = result['solve_time']
             self.last_method = result['method']
+            self.last_status = result.get('status', 'UNKNOWN')
 
-            self.results_table.setRowCount(len(result['groups']))
-            for i, group in enumerate(result['groups']):
+            display_groups = result['groups'][:MAX_DISPLAYED_GROUPS]
+            self.results_table.setRowCount(len(display_groups))
+            for i, group in enumerate(display_groups):
                 self.results_table.setItem(i, 0, QTableWidgetItem(str(i + 1)))
                 self.results_table.setItem(i, 1, QTableWidgetItem(", ".join(map(str, group))))
 
-            self.stats_label.setText(f"Loaded from DB | Groups: {result['num_groups']}")
+            display_note = (
+                f" | Showing first {MAX_DISPLAYED_GROUPS}"
+                if len(result['groups']) > MAX_DISPLAYED_GROUPS else ""
+            )
+            self.stats_label.setText(
+                f"Loaded from DB | Status: {self.last_status} | Groups: {result['num_groups']}{display_note}"
+            )
             self.save_btn.setEnabled(True)
             self.tab_widget.setCurrentIndex(0)
 

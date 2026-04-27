@@ -41,7 +41,7 @@ The **Optimal Samples Selection System** is a software application designed to s
 
 - **Parameter Configuration**: Support for all valid parameter combinations (m, n, k, j, s)
 - **Sample Selection**: Random or manual sample selection
-- **Optimal Solving**: Uses Integer Linear Programming (ILP) with OR-Tools for guaranteed optimal solutions
+- **Optimization Solving**: Uses Integer Linear Programming (ILP) with OR-Tools. Results are marked as optimal only when the solver or cache proves optimality.
 - **Database Storage**: Save, load, and manage results
 - **User-Friendly Interface**: Intuitive PyQt5 desktop GUI
 - **Mobile Support**: Kivy-based mobile application (Android/iOS)
@@ -331,6 +331,8 @@ pip3 install ortools
 - For large n values (>15), solving may take longer
 - The solver has a 5-minute timeout
 - Try smaller parameter values for faster results
+- Very large parameter sets are blocked before solving if they would create too many coverage checks. If a cached La Jolla/project result exists, the system loads that result instead of building the full ILP model.
+- The desktop solver uses OR-Tools CPU search. GPU acceleration is not supported for this CP-SAT/ILP workflow.
 
 ### Problem: "No solution found"
 
@@ -345,7 +347,7 @@ pip3 install ortools
 
 **Q: What algorithm does the system use?**
 
-A: The system uses Integer Linear Programming (ILP) solved by Google OR-Tools CP-SAT solver. This guarantees optimal (minimum) solutions.
+A: The system uses Integer Linear Programming (ILP) solved by Google OR-Tools CP-SAT solver. It guarantees optimal (minimum) solutions only when the solver status is `OPTIMAL`; `FEASIBLE` means a valid solution was found but optimality has not been proven.
 
 **Q: How long does solving take?**
 

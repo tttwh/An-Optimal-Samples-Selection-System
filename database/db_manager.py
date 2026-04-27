@@ -55,7 +55,7 @@ class DatabaseManager:
 
     def save_result(self, m: int, n: int, k: int, j: int, s: int,
                     samples: List[int], groups: List[Tuple],
-                    solve_time: float, method: str) -> str:
+                    solve_time: float, method: str, status: str = "UNKNOWN") -> str:
         """
         Save a result to database.
 
@@ -93,6 +93,7 @@ class DatabaseManager:
                 samples TEXT,
                 solve_time REAL,
                 method TEXT,
+                status TEXT,
                 created_at TEXT,
                 num_groups INTEGER
             )
@@ -108,9 +109,9 @@ class DatabaseManager:
 
         # Insert metadata
         cursor.execute('''
-            INSERT INTO metadata (m, n, k, j, s, samples, solve_time, method, created_at, num_groups)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (m, n, k, j, s, json.dumps(samples), solve_time, method,
+            INSERT INTO metadata (m, n, k, j, s, samples, solve_time, method, status, created_at, num_groups)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (m, n, k, j, s, json.dumps(samples), solve_time, method, status,
               datetime.now().isoformat(), num_results))
 
         # Insert groups
@@ -155,17 +156,22 @@ class DatabaseManager:
             cursor.execute('SELECT group_index, members FROM groups ORDER BY group_index')
             group_rows = cursor.fetchall()
 
+            cursor.execute('PRAGMA table_info(metadata)')
+            columns = [row[1] for row in cursor.fetchall()]
+            meta = dict(zip(columns, meta_row))
+
             result = {
-                'm': meta_row[1],
-                'n': meta_row[2],
-                'k': meta_row[3],
-                'j': meta_row[4],
-                's': meta_row[5],
-                'samples': json.loads(meta_row[6]),
-                'solve_time': meta_row[7],
-                'method': meta_row[8],
-                'created_at': meta_row[9],
-                'num_groups': meta_row[10],
+                'm': meta['m'],
+                'n': meta['n'],
+                'k': meta['k'],
+                'j': meta['j'],
+                's': meta['s'],
+                'samples': json.loads(meta['samples']),
+                'solve_time': meta['solve_time'],
+                'method': meta['method'],
+                'status': meta.get('status', 'UNKNOWN'),
+                'created_at': meta['created_at'],
+                'num_groups': meta['num_groups'],
                 'groups': [tuple(json.loads(row[1])) for row in group_rows]
             }
 
@@ -230,3 +236,196 @@ class DatabaseManager:
     def get_db_folder(self) -> str:
         """Return the database folder path."""
         return self.db_folder
+
+    def _known_covers_path(self) -> str:
+        return os.path.join(self.db_folder, 'known_covers.sqlite')
+
+    def _connect_known_covers(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self._known_covers_path())
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS standard_covers (
+                v INTEGER NOT NULL,
+                k INTEGER NOT NULL,
+                t INTEGER NOT NULL,
+                lower_bound INTEGER,
+                upper_bound INTEGER NOT NULL,
+                is_proven_optimal INTEGER NOT NULL DEFAULT 0,
+                blocks TEXT NOT NULL,
+                source_url TEXT,
+                source_updated_at TEXT,
+                construction_method TEXT,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (v, k, t)
+            )
+        ''')
+        conn.execute('''
+            CREATE TABLE IF NOT EXISTS project_results (
+                n INTEGER NOT NULL,
+                k INTEGER NOT NULL,
+                j INTEGER NOT NULL,
+                s INTEGER NOT NULL,
+                num_groups INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                method TEXT,
+                groups TEXT NOT NULL,
+                source TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (n, k, j, s)
+            )
+        ''')
+        return conn
+
+    def save_standard_cover(self, v: int, k: int, t: int, lower_bound: int,
+                            upper_bound: int, blocks: List[Tuple],
+                            is_proven_optimal: bool = False,
+                            source_url: str = None,
+                            source_updated_at: str = None,
+                            construction_method: str = None) -> None:
+        conn = self._connect_known_covers()
+        try:
+            conn.execute('''
+                INSERT OR REPLACE INTO standard_covers
+                (v, k, t, lower_bound, upper_bound, is_proven_optimal, blocks,
+                 source_url, source_updated_at, construction_method, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                v, k, t, lower_bound, upper_bound, int(is_proven_optimal),
+                json.dumps([list(block) for block in blocks]),
+                source_url, source_updated_at, construction_method,
+                datetime.now().isoformat(),
+            ))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_standard_cover(self, v: int, k: int, t: int) -> Optional[dict]:
+        conn = self._connect_known_covers()
+        try:
+            cursor = conn.execute('''
+                SELECT v, k, t, lower_bound, upper_bound, is_proven_optimal,
+                       blocks, source_url, source_updated_at, construction_method
+                FROM standard_covers
+                WHERE v = ? AND k = ? AND t = ?
+            ''', (v, k, t))
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return {
+                'v': row[0],
+                'k': row[1],
+                't': row[2],
+                'lower_bound': row[3],
+                'upper_bound': row[4],
+                'is_proven_optimal': bool(row[5]),
+                'blocks': [tuple(block) for block in json.loads(row[6])],
+                'source_url': row[7],
+                'source_updated_at': row[8],
+                'construction_method': row[9],
+            }
+        finally:
+            conn.close()
+
+    def save_project_result(self, n: int, k: int, j: int, s: int,
+                            groups: List[Tuple], status: str,
+                            method: str = None, source: str = None) -> None:
+        existing = self.get_project_result(n, k, j, s)
+        if existing and not self._should_replace_project_result(existing, len(groups), status):
+            return
+
+        now = datetime.now().isoformat()
+        created_at = existing['created_at'] if existing else now
+
+        conn = self._connect_known_covers()
+        try:
+            conn.execute('''
+                INSERT OR REPLACE INTO project_results
+                (n, k, j, s, num_groups, status, method, groups, source, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                n, k, j, s, len(groups), status, method,
+                json.dumps([list(group) for group in groups]),
+                source, created_at, now,
+            ))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def get_project_result(self, n: int, k: int, j: int, s: int) -> Optional[dict]:
+        conn = self._connect_known_covers()
+        try:
+            cursor = conn.execute('''
+                SELECT n, k, j, s, num_groups, status, method, groups, source, created_at, updated_at
+                FROM project_results
+                WHERE n = ? AND k = ? AND j = ? AND s = ?
+            ''', (n, k, j, s))
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return {
+                'n': row[0],
+                'k': row[1],
+                'j': row[2],
+                's': row[3],
+                'num_groups': row[4],
+                'status': row[5],
+                'method': row[6],
+                'groups': [tuple(group) for group in json.loads(row[7])],
+                'source': row[8],
+                'created_at': row[9],
+                'updated_at': row[10],
+            }
+        finally:
+            conn.close()
+
+    def _should_replace_project_result(self, existing: dict, new_size: int, new_status: str) -> bool:
+        if existing['status'] == 'OPTIMAL':
+            return new_status == 'OPTIMAL' and new_size < existing['num_groups']
+        if new_status == 'OPTIMAL':
+            return True
+        return new_size < existing['num_groups']
+
+    def seed_builtin_known_covers(self) -> None:
+        """Seed small verified covers used by the assignment examples."""
+        covers = [
+            {
+                'v': 7, 'k': 6, 't': 5, 'lower': 6, 'upper': 6,
+                'blocks': [
+                    (1, 2, 3, 4, 5, 7), (1, 2, 3, 4, 6, 7),
+                    (1, 2, 3, 5, 6, 7), (1, 2, 4, 5, 6, 7),
+                    (1, 3, 4, 5, 6, 7), (2, 3, 4, 5, 6, 7),
+                ],
+            },
+            {
+                'v': 8, 'k': 6, 't': 5, 'lower': 12, 'upper': 12,
+                'blocks': [
+                    (1, 2, 3, 4, 5, 8), (1, 2, 3, 4, 6, 7),
+                    (1, 2, 3, 5, 6, 7), (1, 2, 3, 6, 7, 8),
+                    (1, 2, 4, 5, 6, 8), (1, 2, 4, 5, 7, 8),
+                    (1, 3, 4, 5, 6, 8), (1, 3, 4, 5, 7, 8),
+                    (1, 3, 5, 6, 7, 8), (2, 3, 4, 5, 6, 7),
+                    (2, 3, 4, 6, 7, 8), (2, 3, 5, 6, 7, 8),
+                ],
+            },
+            {
+                'v': 9, 'k': 6, 't': 4, 'lower': 12, 'upper': 12,
+                'blocks': [
+                    (1, 2, 3, 4, 5, 9), (1, 2, 3, 5, 7, 8),
+                    (1, 2, 3, 6, 8, 9), (1, 2, 4, 5, 6, 7),
+                    (1, 2, 4, 7, 8, 9), (1, 3, 4, 5, 6, 8),
+                    (1, 3, 4, 6, 7, 9), (1, 5, 6, 7, 8, 9),
+                    (2, 3, 4, 6, 7, 8), (2, 3, 5, 6, 7, 9),
+                    (2, 4, 5, 6, 8, 9), (3, 4, 5, 7, 8, 9),
+                ],
+            },
+        ]
+
+        for cover in covers:
+            self.save_standard_cover(
+                cover['v'], cover['k'], cover['t'],
+                cover['lower'], cover['upper'], cover['blocks'],
+                is_proven_optimal=cover['lower'] == cover['upper'],
+                source_url='https://ljcr.dmgordon.org/cover/table.html',
+                source_updated_at='2026-04-21 19:09:46',
+                construction_method='assignment example / La Jolla cover',
+            )
