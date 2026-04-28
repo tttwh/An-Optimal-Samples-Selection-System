@@ -17,7 +17,7 @@ from PyQt5.QtWidgets import (
     QTabWidget, QListWidget, QListWidgetItem, QSplitter, QProgressBar,
     QComboBox, QHeaderView, QAbstractItemView
 )
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal, QElapsedTimer
 from PyQt5.QtGui import QFont, QIntValidator
 
 import os
@@ -33,25 +33,53 @@ MAX_DISPLAYED_GROUPS = 5000
 
 
 class SolverThread(QThread):
-    """Background thread for running the solver."""
+    """Background thread for running the solver (supports multi-round training)."""
     finished = pyqtSignal(list, float, str, str)
     error = pyqtSignal(str)
     progress = pyqtSignal(int, int, int)
+    round_progress = pyqtSignal(int, int, int)  # current_round, total_rounds, best_size
 
-    def __init__(self, solver, initial_solution=None, initial_solution_status="FEASIBLE"):
+    TIME_LIMIT_PER_ROUND = 70.0
+
+    def __init__(self, solver, initial_solution=None, initial_solution_status="FEASIBLE",
+                 num_rounds=1):
         super().__init__()
         self.solver = solver
         self.initial_solution = initial_solution
         self.initial_solution_status = initial_solution_status
+        self.num_rounds = max(1, num_rounds)
 
     def run(self):
         try:
-            result, solve_time, method = self.solver.solve_ilp(
-                progress_callback=lambda d, c, b: self.progress.emit(d, c, b),
-                initial_solution=self.initial_solution,
-                initial_solution_status=self.initial_solution_status,
-            )
-            self.finished.emit(result, solve_time, method, self.solver.last_status)
+            import time as _time
+            best_result = self.initial_solution
+            best_status = self.initial_solution_status
+            best_method = "Cached upper bound"
+            total_time = 0.0
+
+            for rnd in range(1, self.num_rounds + 1):
+                result, solve_time, method = self.solver.solve_ilp(
+                    progress_callback=lambda d, c, b: self.progress.emit(d, c, b),
+                    initial_solution=best_result,
+                    initial_solution_status=best_status,
+                    time_limit_seconds=self.TIME_LIMIT_PER_ROUND,
+                    relative_gap_limit=0.10,
+                )
+                total_time += solve_time
+                current_status = self.solver.last_status
+
+                if best_result is None or len(result) < len(best_result):
+                    best_result = result
+                    best_status = current_status
+                    best_method = f"{method} (round {rnd}/{self.num_rounds})"
+
+                self.round_progress.emit(rnd, self.num_rounds,
+                                         len(best_result) if best_result else -1)
+
+                if current_status == "OPTIMAL":
+                    break
+
+            self.finished.emit(best_result, total_time, best_method, best_status)
         except Exception as e:
             self.error.emit(str(e))
 
@@ -70,6 +98,12 @@ class MainWindow(QMainWindow):
         self.last_solve_time = 0.0
         self.last_method = ""
         self.last_status = "NOT_SOLVED"
+
+        self._progress_timer = QTimer(self)
+        self._progress_timer.setInterval(8)
+        self._progress_timer.timeout.connect(self._tick_progress)
+        self._elapsed = QElapsedTimer()
+        self._total_budget_ms = 0
 
         self.init_ui()
 
@@ -140,6 +174,11 @@ class MainWindow(QMainWindow):
         self.s_spin.setRange(3, 7)
         self.s_spin.setValue(4)
 
+        self.r_spin = QSpinBox()
+        self.r_spin.setRange(1, 20)
+        self.r_spin.setValue(1)
+        self.r_spin.setToolTip("Number of training rounds. Each round uses the previous best solution as a warm-start hint.")
+
         # Add labels and spinboxes
         param_layout.addWidget(QLabel("m (Total samples, 45-54):"), 0, 0)
         param_layout.addWidget(self.m_spin, 0, 1)
@@ -155,6 +194,9 @@ class MainWindow(QMainWindow):
 
         param_layout.addWidget(QLabel("s (Min overlap, 3-7):"), 4, 0)
         param_layout.addWidget(self.s_spin, 4, 1)
+
+        param_layout.addWidget(QLabel("r (Training rounds, ≥1):"), 5, 0)
+        param_layout.addWidget(self.r_spin, 5, 1)
 
         # Connect spinbox changes for validation
         self.k_spin.valueChanged.connect(self.update_constraints)
@@ -227,6 +269,11 @@ class MainWindow(QMainWindow):
         self.progress_bar.setVisible(False)
         layout.addWidget(self.progress_bar)
 
+        self.round_label = QLabel("")
+        self.round_label.setAlignment(Qt.AlignCenter)
+        self.round_label.setVisible(False)
+        layout.addWidget(self.round_label)
+
         # Results section
         results_group = QGroupBox("Results")
         results_layout = QVBoxLayout(results_group)
@@ -236,7 +283,7 @@ class MainWindow(QMainWindow):
         results_layout.addWidget(self.stats_label)
 
         self.status_help_label = QLabel(
-            "Status: OPTIMAL = proven minimum; FEASIBLE = valid but not proven minimum; "
+            "Status: OPTIMAL = proven minimum; FEASIBLE = valid solution within ≤10% of optimal; "
             "FEASIBLE_CACHED = cached upper-bound result."
         )
         self.status_help_label.setWordWrap(True)
@@ -414,19 +461,45 @@ class MainWindow(QMainWindow):
                 self.status_bar.showMessage(f"Loaded {len(initial_solution)} optimal groups from cache")
                 return
 
-            self.status_bar.showMessage(f"Solving... (j-subsets: {stats['num_j_subsets']}, k-groups: {stats['num_k_groups']})")
+            r = self.r_spin.value()
+            self.status_bar.showMessage(
+                f"Solving {r} round(s)... (j-subsets: {stats['num_j_subsets']}, k-groups: {stats['num_k_groups']})"
+            )
+            self._total_budget_ms = int(SolverThread.TIME_LIMIT_PER_ROUND * r * 1000)
             self.progress_bar.setVisible(True)
-            self.progress_bar.setRange(0, 0)  # Indeterminate
+            self.progress_bar.setRange(0, 1000)
+            self.progress_bar.setValue(0)
+            self.progress_bar.setFormat("%p%")
+            self.round_label.setText(f"Round 0 / {r}")
+            self.round_label.setVisible(True)
             self.solve_btn.setEnabled(False)
+            self._elapsed.start()
+            self._progress_timer.start()
 
             # Run solver in background thread
-            self.solver_thread = SolverThread(solver, initial_solution, initial_status)
+            self.solver_thread = SolverThread(solver, initial_solution, initial_status,
+                                              num_rounds=r)
             self.solver_thread.finished.connect(self.on_solve_finished)
             self.solver_thread.error.connect(self.on_solve_error)
+            self.solver_thread.round_progress.connect(self.on_round_progress)
             self.solver_thread.start()
 
         except ValueError as e:
             QMessageBox.critical(self, "Error", str(e))
+
+    def on_round_progress(self, current_round, total_rounds, best_size):
+        """Update round label after each training round completes."""
+        size_str = f" | Best so far: {best_size}" if best_size >= 0 else ""
+        self.round_label.setText(f"Round {current_round} / {total_rounds}{size_str}")
+        self.status_bar.showMessage(f"Completed round {current_round} / {total_rounds}...")
+
+    def _tick_progress(self):
+        """Advance the progress bar based on elapsed wall-clock time."""
+        if self._total_budget_ms <= 0:
+            return
+        elapsed = self._elapsed.elapsed()
+        value = min(999, int(elapsed * 1000 / self._total_budget_ms))
+        self.progress_bar.setValue(value)
 
     def estimate_problem_size(self, n, k, j, s):
         estimate = estimate_coverage_generation(n, k, j, s)
@@ -523,7 +596,10 @@ class MainWindow(QMainWindow):
 
     def on_solve_finished(self, result, solve_time, method, status):
         """Handle solver completion."""
+        self._progress_timer.stop()
+        self.progress_bar.setValue(1000)
         self.progress_bar.setVisible(False)
+        self.round_label.setVisible(False)
         self.solve_btn.setEnabled(True)
         self.current_results = result
 
@@ -538,9 +614,16 @@ class MainWindow(QMainWindow):
         )
 
         # Update stats
+        solver = getattr(self.solver_thread, 'solver', None) if self.solver_thread else None
+        best_bound = getattr(solver, 'last_best_bound', None) if solver else None
+        gap_str = ""
+        if best_bound and best_bound > 0 and len(result) > 0:
+            gap = (len(result) - best_bound) / best_bound * 100
+            gap_str = f" | Gap: {gap:.1f}%"
+
         self.stats_label.setText(
             f"Method: {method} | Status: {status} | Time: {solve_time:.3f}s | "
-            f"Groups found: {len(result)}"
+            f"Groups found: {len(result)}{gap_str}"
         )
 
         # Update table
@@ -564,7 +647,9 @@ class MainWindow(QMainWindow):
 
     def on_solve_error(self, error_msg):
         """Handle solver error."""
+        self._progress_timer.stop()
         self.progress_bar.setVisible(False)
+        self.round_label.setVisible(False)
         self.solve_btn.setEnabled(True)
         QMessageBox.critical(self, "Solver Error", error_msg)
         self.status_bar.showMessage("Solver failed")
