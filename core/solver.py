@@ -159,12 +159,13 @@ class OptimalSamplesSolver:
     def solve_ilp(
         self,
         progress_callback: Optional[Callable[[int, int, int], None]] = None,
-        time_limit_seconds: float = 300.0,
+        time_limit_seconds: float = 70.0,
         prefer_ortools: bool = True,
         allow_pulp: bool = True,
         initial_solution: Optional[List[Tuple]] = None,
         initial_solution_status: str = "FEASIBLE",
         num_search_workers: Optional[int] = None,
+        relative_gap_limit: float = 0.10,
     ) -> Tuple[List[Tuple], float, str]:
         """Solve the instance.
 
@@ -188,6 +189,7 @@ class OptimalSamplesSolver:
                     time_limit_seconds=time_limit_seconds,
                     initial_solution=initial_solution,
                     num_search_workers=num_search_workers,
+                    relative_gap_limit=relative_gap_limit,
                 )
                 method = "OR-Tools CP-SAT"
                 return result, time.time() - start_time, method
@@ -203,7 +205,10 @@ class OptimalSamplesSolver:
 
         if allow_pulp:
             try:
-                result = self._solve_with_pulp(time_limit_seconds=time_limit_seconds)
+                result = self._solve_with_pulp(
+                    time_limit_seconds=time_limit_seconds,
+                    relative_gap_limit=relative_gap_limit,
+                )
                 method = "PuLP CBC"
                 return result, time.time() - start_time, method
             except ImportError:
@@ -219,9 +224,10 @@ class OptimalSamplesSolver:
 
     def _solve_with_ortools(
         self,
-        time_limit_seconds: float = 300.0,
+        time_limit_seconds: float = 70.0,
         initial_solution: Optional[List[Tuple]] = None,
         num_search_workers: Optional[int] = None,
+        relative_gap_limit: float = 0.10,
     ) -> List[Tuple]:
         from ortools.sat.python import cp_model
 
@@ -243,6 +249,7 @@ class OptimalSamplesSolver:
 
         solver = cp_model.CpSolver()
         solver.parameters.max_time_in_seconds = float(time_limit_seconds)
+        solver.parameters.relative_gap_limit = float(relative_gap_limit)
         if num_search_workers is None:
             num_search_workers = default_num_search_workers()
         solver.parameters.num_search_workers = int(num_search_workers)
@@ -270,7 +277,7 @@ class OptimalSamplesSolver:
 
         return group_ids if self.verify_solution(initial_solution) else []
 
-    def _solve_with_pulp(self, time_limit_seconds: float = 300.0) -> List[Tuple]:
+    def _solve_with_pulp(self, time_limit_seconds: float = 65.0, relative_gap_limit: float = 0.10) -> List[Tuple]:
         import pulp
 
         num_groups = len(self.k_groups)
@@ -283,14 +290,19 @@ class OptimalSamplesSolver:
         for i, covering_group_ids in enumerate(self.subset_to_groups):
             prob += pulp.lpSum(x[g] for g in covering_group_ids) >= 1
 
-        prob.solve(pulp.PULP_CBC_CMD(msg=0, timeLimit=float(time_limit_seconds)))
+        prob.solve(pulp.PULP_CBC_CMD(msg=0, timeLimit=float(time_limit_seconds), fracGap=float(relative_gap_limit)))
 
-        if prob.status == pulp.LpStatusOptimal:
-            result = [self.k_groups[g] for g in range(num_groups) if pulp.value(x[g]) == 1]
-            self.last_status = "OPTIMAL"
-            self.last_objective = len(result)
-            self.last_best_bound = len(result)
-            return result
+        if prob.status in (pulp.LpStatusOptimal, pulp.LpStatus.get(0, None)) or pulp.value(pulp.lpSum(x)) is not None:
+            try:
+                result = [self.k_groups[g] for g in range(num_groups) if (pulp.value(x[g]) or 0) >= 0.5]
+                if result:
+                    is_optimal = prob.status == pulp.LpStatusOptimal
+                    self.last_status = "OPTIMAL" if is_optimal else "FEASIBLE"
+                    self.last_objective = len(result)
+                    self.last_best_bound = len(result) if is_optimal else None
+                    return result
+            except Exception:
+                pass
         raise RuntimeError("No solution found")
 
     def _greedy_feasible_solution(self) -> List[int]:
