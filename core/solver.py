@@ -165,9 +165,13 @@ class OptimalSamplesSolver:
         initial_solution: Optional[List[Tuple]] = None,
         initial_solution_status: str = "FEASIBLE",
         num_search_workers: Optional[int] = None,
+<<<<<<< HEAD
         relative_gap_limit: float = 0.05,
         extension_seconds: float = 5.0,
         early_stop_gap: float = 0.02,
+=======
+        relative_gap_limit: float = 0.10,
+>>>>>>> 311a0a2c5536d8f6c482ee28606985489c1947ba
     ) -> Tuple[List[Tuple], float, str]:
         """Solve the instance.
 
@@ -179,12 +183,15 @@ class OptimalSamplesSolver:
         - Otherwise, or if OR-Tools is unavailable, try PuLP.
         - Otherwise fall back to an exact Branch and Bound search.
 
+<<<<<<< HEAD
         Time behaviour:
         - Stops early if the gap is already <= early_stop_gap (default 2%).
         - Extends by extension_seconds (default 5s) when the gap is between
           early_stop_gap and relative_gap_limit (2%–5%), trying to close it.
         - Hard upper bound per call: time_limit_seconds + extension_seconds.
 
+=======
+>>>>>>> 311a0a2c5536d8f6c482ee28606985489c1947ba
         If time_limit_seconds is exceeded in the fallback search, a TimeoutError
         is raised.
         """
@@ -198,8 +205,11 @@ class OptimalSamplesSolver:
                     initial_solution=initial_solution,
                     num_search_workers=num_search_workers,
                     relative_gap_limit=relative_gap_limit,
+<<<<<<< HEAD
                     extension_seconds=extension_seconds,
                     early_stop_gap=early_stop_gap,
+=======
+>>>>>>> 311a0a2c5536d8f6c482ee28606985489c1947ba
                 )
                 method = "OR-Tools CP-SAT"
                 return result, time.time() - start_time, method
@@ -237,9 +247,13 @@ class OptimalSamplesSolver:
         time_limit_seconds: float = 70.0,
         initial_solution: Optional[List[Tuple]] = None,
         num_search_workers: Optional[int] = None,
+<<<<<<< HEAD
         relative_gap_limit: float = 0.05,
         extension_seconds: float = 5.0,
         early_stop_gap: float = 0.02,
+=======
+        relative_gap_limit: float = 0.10,
+>>>>>>> 311a0a2c5536d8f6c482ee28606985489c1947ba
     ) -> List[Tuple]:
         from ortools.sat.python import cp_model
 
@@ -259,6 +273,7 @@ class OptimalSamplesSolver:
             for g in initial_group_ids:
                 model.AddHint(x[g], 1)
 
+<<<<<<< HEAD
         if num_search_workers is None:
             num_search_workers = default_num_search_workers()
 
@@ -310,6 +325,22 @@ class OptimalSamplesSolver:
 
             return result
 
+=======
+        solver = cp_model.CpSolver()
+        solver.parameters.max_time_in_seconds = float(time_limit_seconds)
+        solver.parameters.relative_gap_limit = float(relative_gap_limit)
+        if num_search_workers is None:
+            num_search_workers = default_num_search_workers()
+        solver.parameters.num_search_workers = int(num_search_workers)
+
+        status = solver.Solve(model)
+        self.last_status = solver.StatusName(status)
+        self.last_best_bound = solver.BestObjectiveBound()
+        if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            result = [self.k_groups[g] for g in range(num_groups) if solver.Value(x[g]) == 1]
+            self.last_objective = len(result)
+            return result
+>>>>>>> 311a0a2c5536d8f6c482ee28606985489c1947ba
         raise RuntimeError("No solution found")
 
     def _initial_group_indices(self, initial_solution: Optional[List[Tuple]]) -> List[int]:
